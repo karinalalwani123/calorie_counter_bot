@@ -54,11 +54,6 @@ st.markdown("""
 
 # ── Models ─────────────────────────────────────────────────────────────────────
 MODELS = {
-    "Claude Haiku 4.5 (fast)":        "anthropic/claude-haiku-4-5",
-    "Claude Sonnet 4 (recommended)":  "anthropic/claude-sonnet-4",
-    "GPT-4o Mini":                    "openai/gpt-4o-mini",
-    "GPT-4o":                         "openai/gpt-4o",
-    "Gemini Flash 2.0":               "google/gemini-flash-2.0",
     "Llama 3.3 70B (free)":           "meta-llama/llama-3.3-70b-instruct",
     "Mistral Small 3.1 (free)":       "mistralai/mistral-small-3.1-24b-instruct:free",
 }
@@ -93,7 +88,7 @@ for k, v in {
     "food_log":   [],
     "daily_goal": 2000,
     "api_key":    SECRET_API_KEY,  # pre-filled from secrets if available
-    "model":      "anthropic/claude-sonnet-4",
+    "model":      "meta-llama/llama-3.3-70b-instruct",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
