@@ -118,7 +118,25 @@ def search_off(query):
         return None
 
 # ── Unified DB search: USDA first, then OFF ────────────────────────────────────
+# Indian prepared dishes — USDA only has raw ingredients, so skip DB and use Llama reasoning
+INDIAN_DISHES = {
+    "poha", "upma", "idli", "dosa", "sabudana", "khichdi", "biryani",
+    "pulao", "paratha", "halwa", "kheer", "pav bhaji", "pav",
+    "chole", "rajma", "dal makhani", "palak paneer", "paneer butter masala",
+    "butter chicken", "chicken curry", "mutton curry", "sambar", "rasam",
+    "vada", "medu vada", "uttapam", "dhokla", "thepla", "kadhi",
+    "aloo gobi", "baingan", "bhindi", "sabzi", "curry", "korma",
+    "lassi", "chai", "masala chai", "shrikhand", "raita",
+}
+
+def is_indian_dish(query):
+    q = query.lower()
+    return any(dish in q for dish in INDIAN_DISHES)
+
 def search_nutrition(query):
+    # Skip DB for Indian prepared dishes — raw ingredient data would be inaccurate
+    if is_indian_dish(query):
+        return None
     result = search_usda(query)
     if result:
         return result
@@ -131,11 +149,11 @@ def to_grams(quantity, unit):
         "gram": 1, "grams": 1, "g": 1,
         "kg": 1000, "kilogram": 1000,
         "cup": 240, "cups": 240,
-        "bowl": 250, "bowls": 250,
-        "plate": 300, "plates": 300,
+        "bowl": 300, "bowls": 300,
+        "plate": 350, "plates": 350,  # prepared Indian plate ~350g
         "slice": 40, "slices": 40,
         "piece": 100, "pieces": 100,
-        "serving": 150,
+        "serving": 200,
         "tablespoon": 15, "tbsp": 15,
         "teaspoon": 5, "tsp": 5,
         "glass": 250, "glasses": 250,
