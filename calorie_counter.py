@@ -45,63 +45,51 @@ st.markdown("""
     .food-name { font-weight: 500; flex: 1; }
     .food-cal  { color: #d4843a; font-weight: 600; font-family: 'DM Mono', monospace; margin-left: 12px; }
     .section-title { font-size: 13px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: .06em; margin: 1.25rem 0 .6rem; }
-    div[data-testid="stButton"] > button[kind="primary"] {
-        background: #1a1a1a !important; color: white !important; border: none !important;
-        border-radius: 12px !important; font-weight: 500 !important; width: 100%;
-    }
+    .db-badge { font-size: 10px; background: #e8f5e9; color: #2e7d32; border-radius: 99px; padding: 1px 7px; margin-left: 6px; font-weight: 500; }
+    .est-badge { font-size: 10px; background: #fff3e0; color: #e65100; border-radius: 99px; padding: 1px 7px; margin-left: 6px; font-weight: 500; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Models ─────────────────────────────────────────────────────────────────────
-MODELS = {
-    "Llama 3.3 70B (free)":           "meta-llama/llama-3.3-70b-instruct",
-}
-
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "meta-llama/llama-3.3-70b-instruct"
 
-SYSTEM_PROMPT = """You are CalBot, a friendly nutrition assistant embedded in a calorie-tracking app.
-
-Your job:
-1. Help users log food. When they mention eating something, extract nutritional data and respond with a JSON block (even if approximate).
-2. Answer nutrition questions, give meal suggestions, and motivate healthy habits.
-3. Be concise and warm — one short paragraph + data if needed.
-
-When logging food, ALWAYS include this JSON block at the end of your reply (no markdown fences):
-FOOD_LOG_JSON:{"name":"<food>","calories":<int>,"protein":<float>,"carbs":<float>,"fat":<float>}
-
-For questions that don't involve logging, skip the JSON block.
-Use reasonable average values when exact data is unknown. Be encouraging!"""
-
-# ── Load API key from st.secrets (deployment) or session state (local) ────────
-def get_secret_api_key():
+# ── Open Food Facts lookup ─────────────────────────────────────────────────────
+def search_nutrition_db(food_query):
+    """Search Open Food Facts for nutrition data. Returns per-100g data."""
     try:
-        return st.secrets.get("OPENROUTER_API_KEY", "")
+        url = "https://world.openfoodfacts.org/cgi/search.pl"
+        params = {
+            "search_terms": food_query,
+            "search_simple": 1,
+            "action": "process",
+            "json": 1,
+            "page_size": 5,
+            "fields": "product_name,nutriments,serving_size,serving_quantity",
+        }
+        resp = requests.get(url, params=params, timeout=8)
+        data = resp.json()
+        products = data.get("products", [])
+        if not products:
+            return None
+        # Pick best product — prefer one with complete nutriment data
+        for product in products:
+            n = product.get("nutriments", {})
+            if all(k in n for k in ["energy-kcal_100g", "proteins_100g", "carbohydrates_100g", "fat_100g"]):
+                return {
+                    "name": product.get("product_name", food_query),
+                    "calories_per_100g": round(n.get("energy-kcal_100g", 0), 1),
+                    "protein_per_100g":  round(n.get("proteins_100g", 0), 1),
+                    "carbs_per_100g":    round(n.get("carbohydrates_100g", 0), 1),
+                    "fat_per_100g":      round(n.get("fat_100g", 0), 1),
+                    "serving_size":      product.get("serving_size", "100g"),
+                }
+        return None
     except Exception:
-        return ""
+        return None
 
-SECRET_API_KEY = get_secret_api_key()
-
-# ── Session state ──────────────────────────────────────────────────────────────
-for k, v in {
-    "messages":   [],
-    "food_log":   [],
-    "daily_goal": 2000,
-    "api_key":    SECRET_API_KEY,  # pre-filled from secrets if available
-    "model":      "meta-llama/llama-3.3-70b-instruct",
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ── API call ───────────────────────────────────────────────────────────────────
-def call_openrouter(user_msg):
-    api_key = st.session_state.api_key or SECRET_API_KEY
-    if not api_key:
-        st.session_state.messages.append({"role": "user", "content": user_msg})
-        st.session_state.messages.append({"role": "assistant", "content": "⚠️ Please enter your OpenRouter API key in the sidebar first."})
-        return
-
-    st.session_state.messages.append({"role": "user", "content": user_msg})
-
+# ── Extract food name from user message using Llama ───────────────────────────
+def extract_food_info(user_msg, api_key):
+    """Ask Llama to extract food name and quantity from user message."""
     try:
         resp = requests.post(
             OPENROUTER_URL,
@@ -112,50 +100,152 @@ def call_openrouter(user_msg):
                 "X-Title": "CalBot",
             },
             json={
-                "model": st.session_state.model,
-                "max_tokens": 600,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + st.session_state.messages,
+                "model": MODEL,
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "system", "content": """Extract the food item and quantity from the user message.
+Reply ONLY with JSON in this exact format (no other text):
+{"food": "<food name for database search>", "quantity": <number>, "unit": "<piece/gram/cup/bowl/slice>"}
+If no quantity mentioned, use 1. Keep food name simple e.g. 'banana', 'roti', 'chicken breast'."""},
+                    {"role": "user", "content": user_msg}
+                ],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+        # Clean markdown fences if any
+        text = re.sub(r"```json|```", "", text).strip()
+        return json.loads(text)
+    except Exception:
+        return None
+
+# ── Estimate calories with Llama (fallback when DB has no result) ─────────────
+SYSTEM_PROMPT_FALLBACK = """You are CalBot, a nutrition assistant. When the user mentions food:
+1. Give a short friendly response (1-2 sentences).
+2. ALWAYS end with this exact line (no markdown):
+FOOD_LOG_JSON:{"name":"<food>","calories":<int>,"protein":<float>,"carbs":<float>,"fat":<float>}
+
+Use your best knowledge for calorie estimates. For Indian foods use standard values:
+roti/chapati ~120 kcal, paratha ~200 kcal, rice (1 cup cooked) ~200 kcal, dal (1 cup) ~150 kcal.
+Be encouraging and concise!"""
+
+def call_llama_fallback(user_msg, api_key, messages):
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://calbot.app",
+                "X-Title": "CalBot",
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 300,
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT_FALLBACK}] + messages + [{"role": "user", "content": user_msg}],
             },
             timeout=30,
         )
         resp.raise_for_status()
-        reply = resp.json()["choices"][0]["message"]["content"]
-    except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response else "?"
-        if code == 401:
-            reply = "⚠️ Invalid API key — please check your OpenRouter key in the sidebar."
-        elif code == 402:
-            reply = "⚠️ Insufficient OpenRouter credits — please top up your account."
-        else:
-            reply = f"⚠️ API error {code}. Please try again."
+        return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        reply = f"⚠️ Connection error: {e}"
+        return f"⚠️ Error: {e}"
 
-    # Parse food JSON — try FOOD_LOG_JSON: tag first
+# ── Main chat function ─────────────────────────────────────────────────────────
+def call_openrouter(user_msg):
+    api_key = st.session_state.api_key or SECRET_API_KEY
+    if not api_key:
+        st.session_state.messages.append({"role": "user", "content": user_msg})
+        st.session_state.messages.append({"role": "assistant", "content": "⚠️ Please enter your OpenRouter API key in the sidebar first."})
+        return
+
+    st.session_state.messages.append({"role": "user", "content": user_msg})
+
     food_data = None
-    if "FOOD_LOG_JSON:" in reply:
-        try:
-            json_str = reply.split("FOOD_LOG_JSON:")[1].strip().split("\n")[0]
-            food_data = json.loads(json_str)
-        except Exception:
-            pass
+    source = None
+    reply = ""
 
-    # Fallback: find any {...} block containing "calories"
+    # Step 1: Extract food + quantity using Llama
+    extracted = extract_food_info(user_msg, api_key)
+
+    if extracted and extracted.get("food"):
+        food_name = extracted["food"]
+        quantity  = extracted.get("quantity", 1)
+        unit      = extracted.get("unit", "piece")
+
+        # Step 2: Search Open Food Facts
+        db_result = search_nutrition_db(food_name)
+
+        if db_result:
+            # Estimate grams based on unit/quantity
+            grams_map = {
+                "gram": quantity, "g": quantity,
+                "kg": quantity * 1000,
+                "cup": quantity * 240,
+                "bowl": quantity * 200,
+                "slice": quantity * 40,
+                "piece": quantity * 100,
+                "serving": quantity * 100,
+            }
+            grams = grams_map.get(unit.lower(), quantity * 100)
+
+            factor = grams / 100
+            cals    = round(db_result["calories_per_100g"] * factor)
+            protein = round(db_result["protein_per_100g"]  * factor, 1)
+            carbs   = round(db_result["carbs_per_100g"]    * factor, 1)
+            fat     = round(db_result["fat_per_100g"]      * factor, 1)
+
+            food_data = {
+                "name":     f"{quantity} {food_name}",
+                "calories": cals,
+                "protein":  protein,
+                "carbs":    carbs,
+                "fat":      fat,
+            }
+            source = "db"
+
+            reply = (
+                f"✅ Found **{food_name}** in the nutrition database! "
+                f"{''.join([f'{quantity} {unit}(s)' if unit != 'piece' else f'{quantity}'])} = "
+                f"**{cals} kcal** | Protein: {protein}g | Carbs: {carbs}g | Fat: {fat}g. Logged! 🎯"
+            )
+
+    # Step 3: Fallback to Llama estimation if DB failed
     if not food_data:
-        matches = re.findall(r'\{[^{}]*"calories"[^{}]*\}', reply)
-        for m in matches:
+        reply = call_llama_fallback(user_msg, api_key, st.session_state.messages[:-1])
+        source = "estimate"
+
+        if "FOOD_LOG_JSON:" in reply:
             try:
-                food_data = json.loads(m)
-                break
+                json_str = reply.split("FOOD_LOG_JSON:")[1].strip().split("\n")[0]
+                food_data = json.loads(json_str)
             except Exception:
                 pass
 
+        if not food_data:
+            matches = re.findall(r'\{[^{}]*"calories"[^{}]*\}', reply)
+            for m in matches:
+                try:
+                    food_data = json.loads(m)
+                    break
+                except Exception:
+                    pass
+
+        # Clean FOOD_LOG_JSON from display
+        if "FOOD_LOG_JSON:" in reply:
+            reply = reply.split("FOOD_LOG_JSON:")[0].strip()
+        if food_data:
+            reply += "\n\n*(Calorie estimate — not from database)*"
+
+    # Log food
     if food_data and "calories" in food_data:
         food_data.setdefault("name", "Food item")
         food_data.setdefault("protein", 0)
         food_data.setdefault("carbs", 0)
         food_data.setdefault("fat", 0)
-        food_data["time"] = datetime.datetime.now().strftime("%I:%M %p")
+        food_data["time"]   = datetime.datetime.now().strftime("%I:%M %p")
+        food_data["source"] = source
         st.session_state.food_log.append(food_data)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -175,11 +265,29 @@ def bar_color(p):
     if p < 90: return "#f0a500"
     return "#e05c5c"
 
+# ── Load secret API key ────────────────────────────────────────────────────────
+def get_secret_api_key():
+    try:
+        return st.secrets.get("OPENROUTER_API_KEY", "")
+    except Exception:
+        return ""
+
+SECRET_API_KEY = get_secret_api_key()
+
+# ── Session state ──────────────────────────────────────────────────────────────
+for k, v in {
+    "messages":   [],
+    "food_log":   [],
+    "daily_goal": 2000,
+    "api_key":    SECRET_API_KEY,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
 
-    # Only show API key input if no secret key is configured
     if not SECRET_API_KEY:
         st.session_state.api_key = st.text_input(
             "OpenRouter API Key", type="password",
@@ -191,22 +299,17 @@ with st.sidebar:
         else:
             st.info("Get a free key at [openrouter.ai](https://openrouter.ai/keys)")
     else:
-        st.success("API key loaded from secrets ✓")
-
-    st.markdown("---")
-    model_label = st.selectbox(
-        "Model",
-        options=list(MODELS.keys()),
-        index=list(MODELS.values()).index(st.session_state.model)
-              if st.session_state.model in MODELS.values() else 1,
-    )
-    st.session_state.model = MODELS[model_label]
+        st.success("API key loaded ✓")
 
     st.markdown("---")
     st.session_state.daily_goal = st.number_input(
         "Daily Calorie Goal", min_value=800, max_value=5000,
         value=st.session_state.daily_goal, step=50,
     )
+
+    st.markdown("---")
+    st.markdown("**Data source**")
+    st.markdown("🟢 Open Food Facts DB\n\n🟡 AI estimate (fallback)")
 
     st.markdown("---")
     if st.button("🗑️ Clear today's log"):
@@ -229,7 +332,7 @@ with left:
     chat_box = st.container(height=420, border=False)
     with chat_box:
         if not st.session_state.messages:
-            st.markdown('<div class="bubble-bot">👋 Hi! I\'m CalBot. Tell me what you\'ve eaten and I\'ll log the calories. Ask me anything about nutrition!</div>', unsafe_allow_html=True)
+            st.markdown('<div class="bubble-bot">👋 Hi! I\'m CalBot. Tell me what you\'ve eaten and I\'ll look up the exact calories from a nutrition database. Ask me anything!</div>', unsafe_allow_html=True)
         for msg in st.session_state.messages:
             content = msg["content"]
             if "FOOD_LOG_JSON:" in content:
@@ -240,13 +343,13 @@ with left:
     with st.form(key="chat_form", clear_on_submit=True):
         user_input = st.text_input(
             "Message",
-            placeholder="e.g. I had 2 scrambled eggs and toast…",
+            placeholder="e.g. I had 2 rotis and dal…",
             label_visibility="collapsed",
         )
         submitted = st.form_submit_button("Send ➤", type="primary", use_container_width=True)
 
     if submitted and user_input.strip():
-        with st.spinner("CalBot is thinking…"):
+        with st.spinner("Looking up nutrition data…"):
             call_openrouter(user_input.strip())
         st.rerun()
 
@@ -277,9 +380,10 @@ with right:
         st.caption("No food logged yet. Tell CalBot what you've eaten!")
     else:
         for item in reversed(st.session_state.food_log):
+            source_badge = '<span class="db-badge">DB</span>' if item.get("source") == "db" else '<span class="est-badge">EST</span>'
             st.markdown(
                 f'<div class="food-row">'
-                f'<span class="food-name">{item["name"]}</span>'
+                f'<span class="food-name">{item["name"]}{source_badge}</span>'
                 f'<span style="font-size:11px;color:#aaa">{item.get("time","")}</span>'
                 f'<span class="food-cal">{item["calories"]} kcal</span>'
                 f'</div>',
