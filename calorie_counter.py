@@ -503,10 +503,12 @@ with tab_chat:
     </div>""", unsafe_allow_html=True)
 
     for msg in st.session_state.messages:
-        if msg["role"] == "user":
-            st.markdown(f'<div class="bubble bubble-user">{msg["display"]}</div>', unsafe_allow_html=True)
+        role    = msg.get("role", "user")
+        display = msg.get("display") or msg.get("content", "")
+        if role == "user":
+            st.markdown(f'<div class="bubble bubble-user">{display}</div>', unsafe_allow_html=True)
         else:
-            html = msg.get("html") or msg["display"]
+            html = msg.get("html") or display
             st.markdown(f'<div class="bubble bubble-bot"><div class="bot-tag">Nourish AI</div>{html}</div>', unsafe_allow_html=True)
 
     prefill = st.session_state.pop("prefill", "")
@@ -525,7 +527,7 @@ with tab_chat:
 
         api_msgs = [{"role":"system","content":SYSTEM_PROMPT}]
         for m in st.session_state.messages[:-1]:
-            api_msgs.append({"role":m["role"],"content":m["display"]})
+            api_msgs.append({"role": m.get("role","user"), "content": m.get("display") or m.get("content", "")})
         api_msgs.append({"role":"user","content":query})
 
         placeholder = st.empty()
