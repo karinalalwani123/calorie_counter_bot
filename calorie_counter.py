@@ -45,51 +45,110 @@ st.markdown("""
     .food-name { font-weight: 500; flex: 1; }
     .food-cal  { color: #d4843a; font-weight: 600; font-family: 'DM Mono', monospace; margin-left: 12px; }
     .section-title { font-size: 13px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: .06em; margin: 1.25rem 0 .6rem; }
-    .db-badge { font-size: 10px; background: #e8f5e9; color: #2e7d32; border-radius: 99px; padding: 1px 7px; margin-left: 6px; font-weight: 500; }
-    .est-badge { font-size: 10px; background: #fff3e0; color: #e65100; border-radius: 99px; padding: 1px 7px; margin-left: 6px; font-weight: 500; }
+    .usda-badge { font-size: 10px; background: #e3f2fd; color: #1565c0; border-radius: 99px; padding: 1px 7px; margin-left: 6px; font-weight: 500; }
+    .off-badge  { font-size: 10px; background: #e8f5e9; color: #2e7d32; border-radius: 99px; padding: 1px 7px; margin-left: 6px; font-weight: 500; }
+    .est-badge  { font-size: 10px; background: #fff3e0; color: #e65100; border-radius: 99px; padding: 1px 7px; margin-left: 6px; font-weight: 500; }
 </style>
 """, unsafe_allow_html=True)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "meta-llama/llama-3.3-70b-instruct"
+MODEL          = "meta-llama/llama-3.3-70b-instruct"
+USDA_BASE      = "https://api.nal.usda.gov/fdc/v1"
+USDA_KEY       = "DEMO_KEY"  # Free, no signup needed. Rate limit: 30 req/hr
+OFF_BASE       = "https://world.openfoodfacts.org/cgi/search.pl"
 
-# ── Open Food Facts lookup ─────────────────────────────────────────────────────
-def search_nutrition_db(food_query):
-    """Search Open Food Facts for nutrition data. Returns per-100g data."""
+# ── USDA FoodData Central ──────────────────────────────────────────────────────
+def search_usda(query):
     try:
-        url = "https://world.openfoodfacts.org/cgi/search.pl"
-        params = {
-            "search_terms": food_query,
-            "search_simple": 1,
-            "action": "process",
-            "json": 1,
-            "page_size": 5,
-            "fields": "product_name,nutriments,serving_size,serving_quantity",
-        }
-        resp = requests.get(url, params=params, timeout=8)
-        data = resp.json()
-        products = data.get("products", [])
-        if not products:
-            return None
-        # Pick best product — prefer one with complete nutriment data
-        for product in products:
-            n = product.get("nutriments", {})
-            if all(k in n for k in ["energy-kcal_100g", "proteins_100g", "carbohydrates_100g", "fat_100g"]):
+        resp = requests.get(
+            f"{USDA_BASE}/foods/search",
+            params={"query": query, "pageSize": 5, "api_key": USDA_KEY},
+            timeout=8,
+        )
+        foods = resp.json().get("foods", [])
+        for food in foods:
+            nutrients = {n["nutrientName"]: n["value"] for n in food.get("foodNutrients", [])}
+            cal = nutrients.get("Energy", nutrients.get("Energy (Atwater General Factors)", 0))
+            pro = nutrients.get("Protein", 0)
+            carb = nutrients.get("Carbohydrate, by difference", 0)
+            fat = nutrients.get("Total lipid (fat)", 0)
+            if cal > 0:
                 return {
-                    "name": product.get("product_name", food_query),
-                    "calories_per_100g": round(n.get("energy-kcal_100g", 0), 1),
-                    "protein_per_100g":  round(n.get("proteins_100g", 0), 1),
-                    "carbs_per_100g":    round(n.get("carbohydrates_100g", 0), 1),
-                    "fat_per_100g":      round(n.get("fat_100g", 0), 1),
-                    "serving_size":      product.get("serving_size", "100g"),
+                    "name":             food.get("description", query),
+                    "calories_per_100g": round(cal, 1),
+                    "protein_per_100g":  round(pro, 1),
+                    "carbs_per_100g":    round(carb, 1),
+                    "fat_per_100g":      round(fat, 1),
+                    "source": "usda",
                 }
         return None
     except Exception:
         return None
 
-# ── Extract food name from user message using Llama ───────────────────────────
-def extract_food_info(user_msg, api_key):
-    """Ask Llama to extract food name and quantity from user message."""
+# ── Open Food Facts ────────────────────────────────────────────────────────────
+def search_off(query):
+    try:
+        resp = requests.get(
+            OFF_BASE,
+            params={
+                "search_terms": query, "search_simple": 1,
+                "action": "process", "json": 1,
+                "page_size": 8,
+                "fields": "product_name,nutriments",
+            },
+            timeout=8,
+        )
+        for product in resp.json().get("products", []):
+            n = product.get("nutriments", {})
+            cal = n.get("energy-kcal_100g", 0)
+            pro = n.get("proteins_100g", 0)
+            carb = n.get("carbohydrates_100g", 0)
+            fat = n.get("fat_100g", 0)
+            if cal > 0:
+                return {
+                    "name":             product.get("product_name", query),
+                    "calories_per_100g": round(cal, 1),
+                    "protein_per_100g":  round(pro, 1),
+                    "carbs_per_100g":    round(carb, 1),
+                    "fat_per_100g":      round(fat, 1),
+                    "source": "off",
+                }
+        return None
+    except Exception:
+        return None
+
+# ── Unified DB search: USDA first, then OFF ────────────────────────────────────
+def search_nutrition(query):
+    result = search_usda(query)
+    if result:
+        return result
+    return search_off(query)
+
+# ── Convert quantity+unit to grams ────────────────────────────────────────────
+def to_grams(quantity, unit):
+    unit = unit.lower().strip()
+    mapping = {
+        "gram": 1, "grams": 1, "g": 1,
+        "kg": 1000, "kilogram": 1000,
+        "cup": 240, "cups": 240,
+        "bowl": 250, "bowls": 250,
+        "plate": 300, "plates": 300,
+        "slice": 40, "slices": 40,
+        "piece": 100, "pieces": 100,
+        "serving": 150,
+        "tablespoon": 15, "tbsp": 15,
+        "teaspoon": 5, "tsp": 5,
+        "glass": 250, "glasses": 250,
+        "ml": 1, "liter": 1000, "l": 1000,
+        "oz": 28, "lb": 454,
+        "handful": 30,
+        "roti": 40, "chapati": 40,
+        "paratha": 80,
+    }
+    return quantity * mapping.get(unit, 100)
+
+# ── Extract all food items from message via Llama ─────────────────────────────
+def extract_foods(user_msg, api_key):
     try:
         resp = requests.post(
             OPENROUTER_URL,
@@ -101,36 +160,72 @@ def extract_food_info(user_msg, api_key):
             },
             json={
                 "model": MODEL,
-                "max_tokens": 100,
+                "max_tokens": 250,
                 "messages": [
-                    {"role": "system", "content": """Extract the food item and quantity from the user message.
-Reply ONLY with JSON in this exact format (no other text):
-{"food": "<food name for database search>", "quantity": <number>, "unit": "<piece/gram/cup/bowl/slice>"}
-If no quantity mentioned, use 1. Keep food name simple e.g. 'banana', 'roti', 'chicken breast'."""},
+                    {"role": "system", "content": """Extract ALL food items and quantities from the user message.
+Reply ONLY with a JSON array, no other text, no markdown fences.
+Format: [{"food": "<simple searchable name>", "quantity": <number>, "unit": "<gram/cup/bowl/plate/piece/roti/paratha/slice/glass/tbsp>"}]
+
+Rules:
+- Split combined meals into individual items
+- Use simple English names good for database search
+- For Indian foods use transliterated names: "roti", "dal", "palak paneer", "sabudana khichdi"
+- If no quantity mentioned use 1
+- Guess unit sensibly: liquids=glass/cup, Indian breads=roti/paratha, rice/dal=cup, curries=cup
+
+Examples:
+"2 rotis with palak paneer" -> [{"food":"roti","quantity":2,"unit":"roti"},{"food":"palak paneer","quantity":1,"unit":"cup"}]
+"sabudana khichdi plate" -> [{"food":"sabudana khichdi","quantity":1,"unit":"plate"}]
+"3 eggs and milk" -> [{"food":"egg","quantity":3,"unit":"piece"},{"food":"milk","quantity":1,"unit":"glass"}]"""},
                     {"role": "user", "content": user_msg}
                 ],
             },
             timeout=15,
         )
         resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"].strip()
-        # Clean markdown fences if any
-        text = re.sub(r"```json|```", "", text).strip()
+        text = re.sub(r"```json|```", "", resp.json()["choices"][0]["message"]["content"]).strip()
         return json.loads(text)
     except Exception:
         return None
 
-# ── Estimate calories with Llama (fallback when DB has no result) ─────────────
-SYSTEM_PROMPT_FALLBACK = """You are CalBot, a nutrition assistant. When the user mentions food:
-1. Give a short friendly response (1-2 sentences).
-2. ALWAYS end with this exact line (no markdown):
-FOOD_LOG_JSON:{"name":"<food>","calories":<int>,"protein":<float>,"carbs":<float>,"fat":<float>}
+# ── Llama fallback: estimate from ingredients knowledge ───────────────────────
+def llama_estimate(items, api_key):
+    """Ask Llama to estimate calories by reasoning from ingredients — no hardcoded values."""
+    items_str = ", ".join(f"{i['quantity']} {i['unit']} of {i['food']}" for i in items)
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://calbot.app",
+                "X-Title": "CalBot",
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 500,
+                "messages": [
+                    {"role": "system", "content": """You are a nutrition expert. For each food item given:
+1. Think about its typical ingredients and cooking method
+2. Estimate accurate calories and macros based on that reasoning
+3. Output one line per food item in this exact format (no markdown, no extra text):
+FOOD_LOG_JSON:{"name":"<food name>","calories":<int>,"protein":<float>,"carbs":<float>,"fat":<float>}
 
-Use your best knowledge for calorie estimates. For Indian foods use standard values:
-roti/chapati ~120 kcal, paratha ~200 kcal, rice (1 cup cooked) ~200 kcal, dal (1 cup) ~150 kcal.
-Be encouraging and concise!"""
+Be accurate. Reason from ingredients — do not guess randomly.
+For Indian foods, consider typical preparation: oil/ghee used, main ingredients, portion size.
+After all JSON lines, add one short friendly sentence."""},
+                    {"role": "user", "content": f"Estimate nutrition for: {items_str}"}
+                ],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"⚠️ Error: {e}"
 
-def call_llama_fallback(user_msg, api_key, messages):
+# ── General chat (non-food questions) ─────────────────────────────────────────
+def llama_chat(user_msg, api_key, history):
     try:
         resp = requests.post(
             OPENROUTER_URL,
@@ -143,16 +238,18 @@ def call_llama_fallback(user_msg, api_key, messages):
             json={
                 "model": MODEL,
                 "max_tokens": 300,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT_FALLBACK}] + messages + [{"role": "user", "content": user_msg}],
+                "messages": [
+                    {"role": "system", "content": "You are CalBot, a friendly nutrition assistant. Answer nutrition questions concisely. If the user mentions food they ate, remind them to log it."}
+                ] + history + [{"role": "user", "content": user_msg}],
             },
-            timeout=30,
+            timeout=20,
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"⚠️ Error: {e}"
 
-# ── Main chat function ─────────────────────────────────────────────────────────
+# ── Main chat handler ──────────────────────────────────────────────────────────
 def call_openrouter(user_msg):
     api_key = st.session_state.api_key or SECRET_API_KEY
     if not api_key:
@@ -162,92 +259,79 @@ def call_openrouter(user_msg):
 
     st.session_state.messages.append({"role": "user", "content": user_msg})
 
-    food_data = None
-    source = None
-    reply = ""
+    # Step 1: Extract food items
+    foods = extract_foods(user_msg, api_key)
 
-    # Step 1: Extract food + quantity using Llama
-    extracted = extract_food_info(user_msg, api_key)
+    if not foods:
+        # Not a food message — general chat
+        reply = llama_chat(user_msg, api_key, st.session_state.messages[:-1])
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        return
 
-    if extracted and extracted.get("food"):
-        food_name = extracted["food"]
-        quantity  = extracted.get("quantity", 1)
-        unit      = extracted.get("unit", "piece")
+    logged_items  = []
+    db_lines      = []
+    missed_items  = []
 
-        # Step 2: Search Open Food Facts
-        db_result = search_nutrition_db(food_name)
+    # Step 2: Look up each food in USDA → OFF
+    for item in foods:
+        food  = item.get("food", "")
+        qty   = item.get("quantity", 1)
+        unit  = item.get("unit", "piece")
+        grams = to_grams(qty, unit)
 
-        if db_result:
-            # Estimate grams based on unit/quantity
-            grams_map = {
-                "gram": quantity, "g": quantity,
-                "kg": quantity * 1000,
-                "cup": quantity * 240,
-                "bowl": quantity * 200,
-                "slice": quantity * 40,
-                "piece": quantity * 100,
-                "serving": quantity * 100,
-            }
-            grams = grams_map.get(unit.lower(), quantity * 100)
-
+        db = search_nutrition(food)
+        if db:
             factor = grams / 100
-            cals    = round(db_result["calories_per_100g"] * factor)
-            protein = round(db_result["protein_per_100g"]  * factor, 1)
-            carbs   = round(db_result["carbs_per_100g"]    * factor, 1)
-            fat     = round(db_result["fat_per_100g"]      * factor, 1)
-
-            food_data = {
-                "name":     f"{quantity} {food_name}",
-                "calories": cals,
-                "protein":  protein,
-                "carbs":    carbs,
-                "fat":      fat,
+            entry  = {
+                "name":     f"{qty} {food}",
+                "calories": round(db["calories_per_100g"] * factor),
+                "protein":  round(db["protein_per_100g"]  * factor, 1),
+                "carbs":    round(db["carbs_per_100g"]    * factor, 1),
+                "fat":      round(db["fat_per_100g"]      * factor, 1),
+                "time":     datetime.datetime.now().strftime("%I:%M %p"),
+                "source":   db["source"],
             }
-            source = "db"
+            logged_items.append(entry)
+            src_label = "USDA" if db["source"] == "usda" else "OFF"
+            db_lines.append(f"• {qty} {food} → **{entry['calories']} kcal** [{src_label}]")
+        else:
+            missed_items.append(item)
 
-            reply = (
-                f"✅ Found **{food_name}** in the nutrition database! "
-                f"{''.join([f'{quantity} {unit}(s)' if unit != 'piece' else f'{quantity}'])} = "
-                f"**{cals} kcal** | Protein: {protein}g | Carbs: {carbs}g | Fat: {fat}g. Logged! 🎯"
-            )
-
-    # Step 3: Fallback to Llama estimation if DB failed
-    if not food_data:
-        reply = call_llama_fallback(user_msg, api_key, st.session_state.messages[:-1])
-        source = "estimate"
-
-        if "FOOD_LOG_JSON:" in reply:
-            try:
-                json_str = reply.split("FOOD_LOG_JSON:")[1].strip().split("\n")[0]
-                food_data = json.loads(json_str)
-            except Exception:
-                pass
-
-        if not food_data:
-            matches = re.findall(r'\{[^{}]*"calories"[^{}]*\}', reply)
-            for m in matches:
+    # Step 3: Llama estimates for items not in any DB
+    est_lines = []
+    if missed_items:
+        llama_reply = llama_estimate(missed_items, api_key)
+        for line in llama_reply.split("\n"):
+            if "FOOD_LOG_JSON:" in line:
                 try:
-                    food_data = json.loads(m)
-                    break
+                    fd = json.loads(line.split("FOOD_LOG_JSON:")[1].strip())
+                    fd["time"]   = datetime.datetime.now().strftime("%I:%M %p")
+                    fd["source"] = "estimate"
+                    fd.setdefault("protein", 0)
+                    fd.setdefault("carbs", 0)
+                    fd.setdefault("fat", 0)
+                    logged_items.append(fd)
+                    est_lines.append(f"• {fd['name']} → **{fd['calories']} kcal** [AI estimate]")
                 except Exception:
                     pass
 
-        # Clean FOOD_LOG_JSON from display
-        if "FOOD_LOG_JSON:" in reply:
-            reply = reply.split("FOOD_LOG_JSON:")[0].strip()
-        if food_data:
-            reply += "\n\n*(Calorie estimate — not from database)*"
+    # Save to food log
+    for entry in logged_items:
+        st.session_state.food_log.append(entry)
 
-    # Log food
-    if food_data and "calories" in food_data:
-        food_data.setdefault("name", "Food item")
-        food_data.setdefault("protein", 0)
-        food_data.setdefault("carbs", 0)
-        food_data.setdefault("fat", 0)
-        food_data["time"]   = datetime.datetime.now().strftime("%I:%M %p")
-        food_data["source"] = source
-        st.session_state.food_log.append(food_data)
+    # Build reply
+    parts = []
+    if db_lines:
+        parts.append("✅ **From nutrition database:**\n" + "\n".join(db_lines))
+    if est_lines:
+        parts.append("🟡 **AI estimated (reasoning from ingredients):**\n" + "\n".join(est_lines))
+    if len(logged_items) > 1:
+        total = sum(e["calories"] for e in logged_items)
+        parts.append(f"**Meal total: {total} kcal** 🍽️")
+    if not logged_items:
+        parts.append("Sorry, I couldn't find nutrition data for that. Try rephrasing or be more specific!")
 
+    reply = "\n\n".join(parts)
     st.session_state.messages.append({"role": "assistant", "content": reply})
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -265,7 +349,6 @@ def bar_color(p):
     if p < 90: return "#f0a500"
     return "#e05c5c"
 
-# ── Load secret API key ────────────────────────────────────────────────────────
 def get_secret_api_key():
     try:
         return st.secrets.get("OPENROUTER_API_KEY", "")
@@ -274,7 +357,6 @@ def get_secret_api_key():
 
 SECRET_API_KEY = get_secret_api_key()
 
-# ── Session state ──────────────────────────────────────────────────────────────
 for k, v in {
     "messages":   [],
     "food_log":   [],
@@ -308,8 +390,8 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("**Data source**")
-    st.markdown("🟢 Open Food Facts DB\n\n🟡 AI estimate (fallback)")
+    st.markdown("**Data source legend**")
+    st.markdown("🔵 **USDA** = US Dept. of Agriculture\n\n🟢 **OFF** = Open Food Facts\n\n🟡 **EST** = AI ingredient reasoning")
 
     st.markdown("---")
     if st.button("🗑️ Clear today's log"):
@@ -325,35 +407,32 @@ st.markdown("<hr style='border:none;border-top:1px solid #e8e6df;margin:0 0 1.5r
 
 left, right = st.columns([3, 2], gap="large")
 
-# ── Chat ───────────────────────────────────────────────────────────────────────
 with left:
     st.markdown('<div class="section-title">Chat with CalBot</div>', unsafe_allow_html=True)
 
     chat_box = st.container(height=420, border=False)
     with chat_box:
         if not st.session_state.messages:
-            st.markdown('<div class="bubble-bot">👋 Hi! I\'m CalBot. Tell me what you\'ve eaten and I\'ll look up the exact calories from a nutrition database. Ask me anything!</div>', unsafe_allow_html=True)
+            st.markdown('<div class="bubble-bot">👋 Hi! I\'m CalBot. Tell me what you\'ve eaten and I\'ll look up accurate calories from USDA & Open Food Facts databases. For Indian dishes, I\'ll reason from ingredients!</div>', unsafe_allow_html=True)
         for msg in st.session_state.messages:
             content = msg["content"]
-            if "FOOD_LOG_JSON:" in content:
-                content = content.split("FOOD_LOG_JSON:")[0].strip()
+            content = re.sub(r"FOOD_LOG_JSON:\{.*?\}", "", content).strip()
             css = "bubble-user" if msg["role"] == "user" else "bubble-bot"
             st.markdown(f'<div class="{css}">{content}</div>', unsafe_allow_html=True)
 
     with st.form(key="chat_form", clear_on_submit=True):
         user_input = st.text_input(
             "Message",
-            placeholder="e.g. I had 2 rotis and dal…",
+            placeholder="e.g. 2 rotis with palak paneer and lassi…",
             label_visibility="collapsed",
         )
         submitted = st.form_submit_button("Send ➤", type="primary", use_container_width=True)
 
     if submitted and user_input.strip():
-        with st.spinner("Looking up nutrition data…"):
+        with st.spinner("Fetching nutrition data…"):
             call_openrouter(user_input.strip())
         st.rerun()
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
 with right:
     cals   = total_cals()
     goal   = st.session_state.daily_goal
@@ -380,10 +459,16 @@ with right:
         st.caption("No food logged yet. Tell CalBot what you've eaten!")
     else:
         for item in reversed(st.session_state.food_log):
-            source_badge = '<span class="db-badge">DB</span>' if item.get("source") == "db" else '<span class="est-badge">EST</span>'
+            src = item.get("source", "estimate")
+            if src == "usda":
+                badge = '<span class="usda-badge">USDA</span>'
+            elif src == "off":
+                badge = '<span class="off-badge">OFF</span>'
+            else:
+                badge = '<span class="est-badge">EST</span>'
             st.markdown(
                 f'<div class="food-row">'
-                f'<span class="food-name">{item["name"]}{source_badge}</span>'
+                f'<span class="food-name">{item["name"]}{badge}</span>'
                 f'<span style="font-size:11px;color:#aaa">{item.get("time","")}</span>'
                 f'<span class="food-cal">{item["calories"]} kcal</span>'
                 f'</div>',
