@@ -337,19 +337,31 @@ def call_openrouter(user_msg):
     for entry in logged_items:
         st.session_state.food_log.append(entry)
 
-    # Build reply
-    parts = []
-    if db_lines:
-        parts.append("✅ **From nutrition database:**\n" + "\n".join(db_lines))
-    if est_lines:
-        parts.append("🟡 **AI estimated (reasoning from ingredients):**\n" + "\n".join(est_lines))
-    if len(logged_items) > 1:
-        total = sum(e["calories"] for e in logged_items)
-        parts.append(f"**Meal total: {total} kcal** 🍽️")
-    if not logged_items:
-        parts.append("Sorry, I couldn't find nutrition data for that. Try rephrasing or be more specific!")
+    # Build a natural, conversational reply
+    if logged_items:
+        lines = []
+        for e in logged_items:
+            lines.append(f"{e['name'].title()} — {e['calories']} kcal | Protein: {e['protein']}g | Carbs: {e['carbs']}g | Fat: {e['fat']}g")
 
-    reply = "\n\n".join(parts)
+        if len(logged_items) == 1:
+            item = logged_items[0]
+            reply = (
+                f"Logged! Here's the nutrition breakdown for {item['name'].title()}:\n\n"
+                + "\n".join(lines)
+            )
+        else:
+            total_cal  = sum(e["calories"] for e in logged_items)
+            total_pro  = round(sum(e["protein"] for e in logged_items), 1)
+            total_carb = round(sum(e["carbs"]   for e in logged_items), 1)
+            total_fat  = round(sum(e["fat"]     for e in logged_items), 1)
+            reply = (
+                f"Logged! Here's the nutrition breakdown for your meal:\n\n"
+                + "\n".join(lines)
+                + f"\n\nMeal Total — {total_cal} kcal | Protein: {total_pro}g | Carbs: {total_carb}g | Fat: {total_fat}g"
+            )
+    else:
+        reply = "I couldn't identify the food item. Could you describe it a bit more specifically?"
+
     st.session_state.messages.append({"role": "assistant", "content": reply})
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
